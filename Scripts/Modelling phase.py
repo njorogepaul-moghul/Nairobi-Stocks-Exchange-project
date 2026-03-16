@@ -1,14 +1,14 @@
 """
-safaricom_modelling_pipeline.py
+safaricom_modelling_pipeline_v2.py
 
-Full modelling pipeline for Safaricom stock (NSE data):
-1. Feature engineering (lags, MA, STD, volume log, daily range)
-2. Train/Validation/Test split
-3. Random Forest & XGBoost training and tuning
-4. Evaluation (MAE, RMSE, R²)
-5. Feature importance extraction
-6. Plotting actual vs predicted returns
-7. Saving tuned models
+Enhanced Safaricom Modelling Pipeline:
+- Feature Engineering
+- Train/Validation/Test Split
+- Randomized Search + Optional Grid Search for RF and XGB
+- Evaluation (MAE, RMSE, R²)
+- Feature Importance Extraction
+- Prediction Plotting
+- Model Saving
 """
 
 # ----------------------------
@@ -17,7 +17,7 @@ Full modelling pipeline for Safaricom stock (NSE data):
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV
+from sklearn.model_selection import RandomizedSearchCV, GridSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import xgboost as xgb
 import joblib
@@ -29,11 +29,9 @@ import os
 # ----------------------------
 def prepare_features(df):
     df = df.copy()
-    
-    # Target
     df['Change%'] = np.log(df['Day Price'] / df['Previous'])
     
-    # Lag features (1-5 days)
+    # Lag features
     for lag in range(1, 6):
         df[f'lag{lag}'] = df['Change%'].shift(lag)
     
@@ -43,7 +41,7 @@ def prepare_features(df):
         df[f'MA_{w}'] = df['Day Price'].rolling(w).mean()
         df[f'STD_{w}'] = df['Day Price'].rolling(w).std()
     
-    # Crossovers (optional)
+    # Crossovers
     df['MA_5_vs_MA_50'] = df['MA_5'] - df['MA_50']
     df['MA_12_vs_MA_200'] = df['MA_12'] - df['MA_200']
     
@@ -53,34 +51,31 @@ def prepare_features(df):
     # Daily range
     df['Daily_Range'] = df['Day High'] - df['Day Low']
     
-    # Drop NaNs from rolling calculations
+    # Drop NaNs
     df = df.dropna().reset_index(drop=True)
     
     return df
 
 # ----------------------------
-# 2. Split Data
+# 2. Data Split
 # ----------------------------
 def split_data(df):
     train = df[df['DATE'] < '2022-01-01']
     val   = df[(df['DATE'] >= '2022-01-01') & (df['DATE'] < '2024-01-01')]
     test  = df[df['DATE'] >= '2024-01-01']
     
-    feature_cols = [col for col in df.columns if col not in ['DATE', 'Change%', 'Previous', 'Day Price']]
+    feature_cols = [c for c in df.columns if c not in ['DATE','Day Price','Change%','Previous']]
     
-    X_train = train[feature_cols]
-    y_train = train['Change%']
-    X_val   = val[feature_cols]
-    y_val   = val['Change%']
-    X_test  = test[feature_cols]
-    y_test  = test['Change%']
+    X_train, y_train = train[feature_cols], train['Change%']
+    X_val, y_val = val[feature_cols], val['Change%']
+    X_test, y_test = test[feature_cols], test['Change%']
     
     return X_train, y_train, X_val, y_val, X_test, y_test, feature_cols, test['DATE']
 
 # ----------------------------
-# 3. Train & Tune Random Forest
+# 3. Train & Tune Random Forest with optional Grid Search
 # ----------------------------
-def train_tune_rf(X_train, y_train, X_val, y_val):
+def train_tune_rf(X_train, y_train, X_val, y_val, use_grid=False):
     rf = RandomForestRegressor(random_state=42)
     
     # Randomized Search
@@ -93,11 +88,22 @@ def train_tune_rf(X_train, y_train, X_val, y_val):
     }
     rf_random = RandomizedSearchCV(rf, param_dist, n_iter=10, cv=3, scoring='neg_mean_absolute_error', n_jobs=-1)
     rf_random.fit(X_train, y_train)
-    
-    # Best model
     rf_best = rf_random.best_estimator_
     
-    # Evaluate on validation
+    # Optional Grid Search on narrowed parameters
+    if use_grid:
+        grid_params = {
+            'n_estimators':[rf_best.n_estimators-50, rf_best.n_estimators, rf_best.n_estimators+50],
+            'max_depth':[rf_best.max_depth-1 if rf_best.max_depth else 3, rf_best.max_depth, rf_best.max_depth+1 if rf_best.max_depth else 5],
+            'min_samples_split':[rf_best.min_samples_split-2, rf_best.min_samples_split, rf_best.min_samples_split+2],
+            'min_samples_leaf':[rf_best.min_samples_leaf-1, rf_best.min_samples_leaf, rf_best.min_samples_leaf+1],
+            'max_features':[rf_best.max_features]
+        }
+        rf_grid = GridSearchCV(rf_best, grid_params, cv=3, scoring='neg_mean_absolute_error', n_jobs=-1)
+        rf_grid.fit(X_train, y_train)
+        rf_best = rf_grid.best_estimator_
+    
+    # Validation evaluation
     y_val_pred = rf_best.predict(X_val)
     mae = mean_absolute_error(y_val, y_val_pred)
     rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
@@ -107,9 +113,9 @@ def train_tune_rf(X_train, y_train, X_val, y_val):
     return rf_best
 
 # ----------------------------
-# 4. Train & Tune XGBoost
+# 4. Train & Tune XGBoost with optional Grid Search
 # ----------------------------
-def train_tune_xgb(X_train, y_train, X_val, y_val):
+def train_tune_xgb(X_train, y_train, X_val, y_val, use_grid=False):
     xgb_model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
     
     # Randomized Search
@@ -122,11 +128,22 @@ def train_tune_xgb(X_train, y_train, X_val, y_val):
     }
     xgb_random = RandomizedSearchCV(xgb_model, param_dist, n_iter=10, cv=3, scoring='neg_mean_absolute_error', n_jobs=-1)
     xgb_random.fit(X_train, y_train)
-    
-    # Best model
     xgb_best = xgb_random.best_estimator_
     
-    # Evaluate on validation
+    # Optional Grid Search on narrowed parameters
+    if use_grid:
+        grid_params = {
+            'n_estimators':[xgb_best.n_estimators-50, xgb_best.n_estimators, xgb_best.n_estimators+50],
+            'max_depth':[xgb_best.max_depth-1, xgb_best.max_depth, xgb_best.max_depth+1],
+            'learning_rate':[xgb_best.learning_rate/2, xgb_best.learning_rate, xgb_best.learning_rate*2],
+            'subsample':[xgb_best.subsample],
+            'colsample_bytree':[xgb_best.colsample_bytree]
+        }
+        xgb_grid = GridSearchCV(xgb_best, grid_params, cv=3, scoring='neg_mean_absolute_error', n_jobs=-1)
+        xgb_grid.fit(X_train, y_train)
+        xgb_best = xgb_grid.best_estimator_
+    
+    # Validation evaluation
     y_val_pred = xgb_best.predict(X_val)
     mae = mean_absolute_error(y_val, y_val_pred)
     rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
@@ -136,7 +153,7 @@ def train_tune_xgb(X_train, y_train, X_val, y_val):
     return xgb_best
 
 # ----------------------------
-# 5. Evaluate on 2024 Holdout
+# 5. Evaluate on Test Set
 # ----------------------------
 def evaluate_model(model, X_test, y_test, model_name="Model"):
     y_pred = model.predict(X_test)
